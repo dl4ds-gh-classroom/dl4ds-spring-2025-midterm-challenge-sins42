@@ -131,7 +131,7 @@ def main():
         "learning_rate": 0.0001, # Use a small learning rate for finetuning since it is a pre-trained model
         "epochs": 50,  # Train for longer in a real scenario - using 20 epochs since resnet18 is a larger model that will take time to converge
         "num_workers": 4, # Adjust based on your system
-        "device": "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
         "data_dir": "./data",  # Make sure this directory exists
         "ood_dir": "./data/ood-test",
         "wandb_project": "sp25-ds542-challenge",
