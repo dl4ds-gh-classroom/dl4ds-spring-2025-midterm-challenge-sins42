@@ -19,7 +19,8 @@ import json
 # for Part 3 you have the option of using a predefined, pretrained network to
 # finetune.
 ################################################################################
-def mixup_data(x, y, alpha=1.0, use_cuda=True):
+
+def mixup_data(x, y, alpha=1.0, use_cuda=True): # Gemini aided code 
     """Mixup data augmentation."""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
@@ -59,7 +60,7 @@ def rand_bbox(size, lam):
 
     return bbx1, bby1, bbx2, bby2
 
-def cutmix_data(x, y, alpha=1.0, use_cuda=True):
+def cutmix_data(x, y, alpha=1.0, use_cuda=True): # Gemini aided code 
     """Cutmix data augmentation."""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
