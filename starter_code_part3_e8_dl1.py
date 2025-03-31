@@ -20,32 +20,171 @@ import json
 # finetune.
 ################################################################################
 
-def modify_resnet18_for_cifar(model):
+def modify_resnet18_for_cifar(model, dropout_config):
+    """
+    Modify ResNet18 architecture for CIFAR-100 with customizable dropout placement.
+    
+    Args:
+        model: ResNet18 model to modify
+        dropout_config: Dictionary containing dropout configuration
+            - block_dropout: Dropout rate after each ResNet block
+            - spatial_dropout: Whether to use 2D spatial dropout instead of regular dropout
+            - input_dropout: Dropout rate after initial convolution
+            - attention_dropout: Whether to use attention-based dropout
+            - residual_dropout: Whether to apply dropout to residual connections
+            - stochastic_depth: Whether to apply stochastic depth (skip entire layers)
+    """
+    # Extract configuration parameters with defaults
+    block_dropout = dropout_config.get("block_dropout", 0.2)
+    spatial_dropout = dropout_config.get("spatial_dropout", False)
+    input_dropout = dropout_config.get("input_dropout", 0.0)
+    attention_dropout = dropout_config.get("attention_dropout", False)
+    residual_dropout = dropout_config.get("residual_dropout", False)
+    stochastic_depth = dropout_config.get("stochastic_depth", False)
+    
     # Modify the first convolutional layer
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-
-    # Remove the max pooling layer
+    
+    # Remove the max pooling layer (better for CIFAR's smaller images)
     model.maxpool = nn.Identity()
+    
+    # Store original BasicBlock forward method
+    if residual_dropout or stochastic_depth:
+        from functools import partial
+        
+        # Get the original forward method of BasicBlock
+        original_basicblock_forward = model.layer1[0].__class__.forward
+        
+        # Create a new forward method for BasicBlock
+        def new_basicblock_forward(self, x, drop_prob=0.0, apply_stochastic=False):
+            identity = x
+            
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+            
+            out = self.conv2(out)
+            out = self.bn2(out)
+            
+            if self.downsample is not None:
+                identity = self.downsample(x)
+                
+            # Apply stochastic depth: randomly skip some layers entirely
+            if apply_stochastic and torch.rand(1).item() < drop_prob:
+                return identity
+                
+            # Apply residual dropout: apply dropout to the residual branch
+            if residual_dropout and drop_prob > 0:
+                out = F.dropout(out, p=drop_prob, training=self.training)
+                
+            out += identity
+            out = self.relu(out)
+            
+            return out
+        
+        # Replace the forward method for all BasicBlocks
+        for layer in [model.layer1, model.layer2, model.layer3, model.layer4]:
+            for block in layer:
+                block.forward = partial(new_basicblock_forward, block)
+    
+    # Create new forward method with customized dropout
+    original_forward = model.forward
+    
+    def create_forward_with_dropout(config):
+        def new_forward(x):
+            # Initial conv, bn, relu
+            x = model.conv1(x)
+            x = model.bn1(x)
+            x = model.relu(x)
+            
+            # Optional input dropout
+            if input_dropout > 0:
+                x = F.dropout(x, p=input_dropout, training=model.training)
+            
+            # Layer 1
+            x = model.layer1(x)
+            if block_dropout > 0:
+                if spatial_dropout:
+                    x = F.dropout2d(x, p=block_dropout, training=model.training)
+                else:
+                    x = F.dropout(x, p=block_dropout, training=model.training)
+                
+            # Layer 2
+            x = model.layer2(x)
+            if block_dropout > 0:
+                if spatial_dropout:
+                    x = F.dropout2d(x, p=block_dropout, training=model.training)
+                else:
+                    x = F.dropout(x, p=block_dropout, training=model.training)
+                
+            # Layer 3
+            x = model.layer3(x)
+            if block_dropout > 0:
+                if spatial_dropout:
+                    x = F.dropout2d(x, p=block_dropout, training=model.training)
+                else:
+                    x = F.dropout(x, p=block_dropout, training=model.training)
+                
+            # Layer 4
+            x = model.layer4(x)
+            if block_dropout > 0:
+                if spatial_dropout:
+                    x = F.dropout2d(x, p=block_dropout, training=model.training)
+                else:
+                    x = F.dropout(x, p=block_dropout, training=model.training)
+            
+            # Attention-based dropout (only apply to important features)
+            if attention_dropout:
+                # Calculate feature importance (using average pooling as a proxy)
+                importance = F.adaptive_avg_pool2d(x, 1)
+                importance = importance.view(importance.size(0), -1)
+                importance = torch.sigmoid(importance)  # Scale to [0, 1]
+                
+                # Create dropout mask based on importance
+                mask = torch.bernoulli(importance).to(x.device)
+                mask = mask.view(mask.size(0), mask.size(1), 1, 1)
+                
+                # Apply mask
+                x = x * mask
+            
+            x = model.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = model.fc(x)
+            
+            return x
+        return new_forward
+        
+    model.forward = create_forward_with_dropout(dropout_config)
 
     return model
 
 def load_pretrained_resnet18(CONFIG):
     model = models.resnet18(pretrained=True)
-    model = modify_resnet18_for_cifar(model)  # Modify the first layers
 
-    # Freeze layers (adjust as needed)
-    for name, param in model.named_parameters():
-        if "layer4" not in name and "fc" not in name:
-            param.requires_grad = False
+    # Disable inplace operations for all ReLU layers
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            module.inplace = False
+
+    # Create dropout configuration dictionary
+    dropout_config = {
+        "block_dropout": CONFIG.get("block_dropout", 0.2),
+        "spatial_dropout": CONFIG.get("spatial_dropout", False),
+        "input_dropout": CONFIG.get("input_dropout", 0.0),
+        "attention_dropout": CONFIG.get("attention_dropout", False),
+        "residual_dropout": CONFIG.get("residual_dropout", False),
+        "stochastic_depth": CONFIG.get("stochastic_depth", False),
+    }
+    
+    model = modify_resnet18_for_cifar(model, dropout_config)  # Modify the model
 
     # Modify the final fully connected layer
     num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, 100)
-
-    # Unfreeze the last few convolutional blocks.
-    for name, param in model.named_parameters():
-        if "layer4" in name or "layer3" in name or "fc" in name:
-            param.requires_grad = True
+    fc_dropout = CONFIG.get("fc_dropout", 0.5)  # Higher dropout for FC layer is common
+    model.fc = nn.Sequential(
+        nn.Dropout(fc_dropout),  # Add dropout before the final classification layer
+        nn.Linear(num_ftrs, 100)
+    )
 
     return model.to(CONFIG["device"])
 
@@ -134,18 +273,27 @@ def main():
     # one place to change the configuration.
     # It's also convenient to pass to our experiment tracking tool.
 
-
+    # Experiment 1: Spatial Dropout
     CONFIG = {
         "model": "ResNet18",   # Change name when using a different model
         "batch_size": 512, # run batch size finder to find optimal batch size - this is optimal batch size 
-        "learning_rate": 0.0001, # Use a small learning rate for finetuning since it is a pre-trained model
-        "epochs": 30,  # Train for longer in a real scenario - using 20 epochs since resnet18 is a larger model that will take time to converge
+        "learning_rate": 0.001, # Use a small learning rate for finetuning since it is a pre-trained model
+        "epochs": 60,  # Train for longer in a real scenario - using 20 epochs since resnet18 is a larger model that will take time to converge
         "num_workers": 0, # Adjust based on your system
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "data_dir": "./data",  # Make sure this directory exists
         "ood_dir": "./data/ood-test",
         "wandb_project": "sp25-ds542-challenge",
         "seed": 42,
+        "patience": 10, # Number of epochs to wait for improvement.
+        # Dropout configuration
+        "block_dropout": 0.2,     # Dropout after each block 
+        "spatial_dropout": False,   # Use 2D spatial dropout instead of regular dropout
+        "input_dropout": 0.05,      # Dropout after initial convolution
+        "fc_dropout": 0.05,         # Dropout before final FC layer (was 0.15 in original)
+        "attention_dropout": False, # Use attention-based dropout
+        "residual_dropout": True,  # Apply dropout to residual connections
+        "stochastic_depth": False, # Apply stochastic depth (skip entire layers)
     }
 
     import pprint
@@ -157,12 +305,12 @@ def main():
     ############################################################################
 
     transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        #transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15), #add rotation.
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1), #add color jitter.
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), 
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)), # CIFAR-100 stats
     ])
 
     ###############
@@ -172,7 +320,7 @@ def main():
     # Validation and test transforms (NO augmentation)
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)), # CIFAR-100 stats
     ])
 
     ############################################################################
@@ -220,8 +368,8 @@ def main():
     # Loss Function, Optimizer and optional learning rate scheduler
     ############################################################################
     criterion = nn.CrossEntropyLoss()   
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=1e-4) #Use Adam optimizer
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"]) #Use CosineAnnealingLR scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=5e-4) #Use Adam optimizer
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5) 
 
     # Initialize wandb
     wandb.init(project="-sp25-ds542-challenge", config=CONFIG)
@@ -231,11 +379,13 @@ def main():
     # --- Training Loop (Example - Students need to complete) ---
     ############################################################################
     best_val_acc = 0.0
+    epochs_no_improve = 0 # counter for early stopping.
+
 
     for epoch in range(CONFIG["epochs"]):
         train_loss, train_acc = train(epoch, model, trainloader, optimizer, criterion, CONFIG)
         val_loss, val_acc = validate(model, valloader, criterion, CONFIG["device"])
-        scheduler.step()
+        scheduler.step(val_loss)
 
         # log to WandB
         wandb.log({
@@ -252,6 +402,13 @@ def main():
             best_val_acc = val_acc
             torch.save(model.state_dict(), "best_model.pth")
             wandb.save("best_model.pth") # Save to wandb as well
+            epochs_no_improve = 0 # reset counter.
+        else:
+            epochs_no_improve += 1 #Increment counter.
+
+        if epochs_no_improve == CONFIG["patience"]: #Early stopping condition.
+            print(f"Early stopping triggered after {epoch+1} epochs!")
+            break # Stop training.
 
     wandb.finish()
 
